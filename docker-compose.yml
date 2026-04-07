@@ -7,3 +7,4 @@ services:
     volumes:
       - ./archive:/app/archive
       - ./user_settings.json:/app/user_settings.json
+      - ./topics_history.json:/app/topics_history.json

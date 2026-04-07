@@ -4,5 +4,6 @@ __pycache__/
 archive/images/
 archive/posts.json
 user_settings.json
+topics_history.json
 *.log
 .venv/

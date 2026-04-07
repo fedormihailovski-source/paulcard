@@ -3,7 +3,8 @@
 import asyncio
 import json
 import logging
-from io import BytesIO
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -12,6 +13,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -32,6 +34,7 @@ from generator import (
     search_news,
     format_tg_post,
     card_to_bytes,
+    load_archive,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +42,11 @@ log = logging.getLogger(__name__)
 
 router = Router()
 
-# --- Per-user settings (in-memory + file persistence) ---
+ADMIN_USER_ID = 278199173  # Фёдор
+
+# ============================================================
+# Per-user settings
+# ============================================================
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
 
 
@@ -71,29 +78,86 @@ def set_settings(user_id: int, settings: dict):
     _save_all_settings(all_s)
 
 
-# --- Access control ---
+# ============================================================
+# Topics persistence
+# ============================================================
+TOPICS_FILE = Path(__file__).parent / "topics_history.json"
+
+
+def _load_topics_history() -> list:
+    if TOPICS_FILE.exists():
+        try:
+            return json.loads(TOPICS_FILE.read_text("utf-8"))
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+    return []
+
+
+def _save_topics_history(data: list):
+    TOPICS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+
+def save_topics(topics: list):
+    """Append new topics batch to history."""
+    history = _load_topics_history()
+    batch = {
+        "date": datetime.now().isoformat(),
+        "topics": topics,
+    }
+    history.append(batch)
+    # Keep last 50 batches
+    if len(history) > 50:
+        history = history[-50:]
+    _save_topics_history(history)
+
+
+def get_all_saved_topics() -> list:
+    """Return flat list of all saved topics (newest first)."""
+    history = _load_topics_history()
+    result = []
+    for batch in reversed(history):
+        for t in batch.get("topics", []):
+            if t not in result:
+                result.append(t)
+    return result
+
+
+# ============================================================
+# Access control
+# ============================================================
 def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USERS:
-        return True  # no whitelist = open
+        return True
     return user_id in ALLOWED_USERS
 
 
-# --- FSM States ---
+# ============================================================
+# FSM
+# ============================================================
 class Gen(StatesGroup):
     waiting_topic = State()
 
 
-# --- Keyboards ---
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+# ============================================================
+# Keyboards
+# ============================================================
+def main_menu_kb(user_id: int = 0) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton(text="🔍 Найти темы", callback_data="news"),
             InlineKeyboardButton(text="✏️ Своя тема", callback_data="custom_topic"),
         ],
         [
-            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+            InlineKeyboardButton(text="📋 Сохранённые темы", callback_data="saved_topics:0"),
         ],
-    ])
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
+        ],
+    ]
+    if user_id == ADMIN_USER_ID:
+        rows.append([InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_kb(s: dict) -> InlineKeyboardMarkup:
@@ -106,7 +170,7 @@ def settings_kb(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"Тон: {tone}", callback_data="set_tone")],
         [InlineKeyboardButton(text=f"Карточка: {theme_label}", callback_data="set_theme")],
         [InlineKeyboardButton(text=f"Модель: {model_short}", callback_data="set_model")],
-        [InlineKeyboardButton(text="← Назад", callback_data="back_main")],
+        [InlineKeyboardButton(text="← Меню", callback_data="back_main")],
     ])
 
 
@@ -140,21 +204,48 @@ def model_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def news_topics_kb(topics: list) -> InlineKeyboardMarkup:
+def news_topics_kb(topics: list, offset: int = 0) -> InlineKeyboardMarkup:
     buttons = []
     for i, t in enumerate(topics[:7]):
         topic_text = t.get("topic", "")[:45]
         rubric = t.get("rubric", "")
         buttons.append([InlineKeyboardButton(
             text=f"{rubric} · {topic_text}",
-            callback_data=f"pick:{i}",
+            callback_data=f"pick:{offset + i}",
         )])
-    buttons.append([InlineKeyboardButton(text="🔄 Ещё темы", callback_data="news")])
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Ещё темы", callback_data="news"),
+        InlineKeyboardButton(text="← Меню", callback_data="back_main"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def saved_topics_kb(topics: list, page: int = 0) -> InlineKeyboardMarkup:
+    per_page = 7
+    start = page * per_page
+    chunk = topics[start:start + per_page]
+    buttons = []
+    for i, t in enumerate(chunk):
+        topic_text = t.get("topic", "")[:45]
+        rubric = t.get("rubric", "")
+        buttons.append([InlineKeyboardButton(
+            text=f"{rubric} · {topic_text}",
+            callback_data=f"saved_pick:{start + i}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"saved_topics:{page - 1}"))
+    if start + per_page < len(topics):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"saved_topics:{page + 1}"))
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="← Меню", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# --- Handlers ---
+# ============================================================
+# Handlers
+# ============================================================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -166,7 +257,25 @@ async def cmd_start(message: Message):
         "Генератор карточек и постов о гитаре, джазе, блюзе и оборудовании.\n\n"
         "Выбери действие:",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    if not is_allowed(message.from_user.id):
+        return
+    await _send_help(message)
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if not is_allowed(message.from_user.id):
+        return
+    await message.answer(
+        "🎸 <b>Главное меню</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(message.from_user.id),
     )
 
 
@@ -176,12 +285,25 @@ async def cmd_generate(message: Message):
         return
     topic = message.text.replace("/generate", "").strip()
     if not topic:
-        await message.answer("Укажи тему: <code>/generate Wes Montgomery и октавы</code>", parse_mode=ParseMode.HTML)
+        await message.answer(
+            "Укажи тему: <code>/generate Wes Montgomery и октавы</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     await _do_generate(message, topic)
 
 
-# --- Callbacks ---
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    await _send_stats(message)
+
+
+# ============================================================
+# Callbacks
+# ============================================================
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(cb: CallbackQuery, state: FSMContext):
@@ -189,8 +311,14 @@ async def cb_back_main(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         "🎸 <b>Закрытый клуб Павла Сидоренко</b>\n\nВыбери действие:",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(cb.from_user.id),
     )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "help")
+async def cb_help(cb: CallbackQuery):
+    await _send_help(cb.message, edit=True)
     await cb.answer()
 
 
@@ -202,7 +330,8 @@ async def cb_custom_topic(cb: CallbackQuery, state: FSMContext):
         "Примеры:\n"
         "• <i>Какие струны использует John Mayer</i>\n"
         "• <i>Ibanez Tube Screamer — почему все его копируют</i>\n"
-        "• <i>Celestion Greenback vs Vintage 30</i>",
+        "• <i>Celestion Greenback vs Vintage 30</i>\n\n"
+        "Или отправь /menu чтобы вернуться.",
         parse_mode=ParseMode.HTML,
     )
     await cb.answer()
@@ -216,23 +345,30 @@ async def on_topic_text(message: Message, state: FSMContext):
     await _do_generate(message, message.text.strip())
 
 
+# --- News search ---
+
 @router.callback_query(F.data == "news")
 async def cb_news(cb: CallbackQuery):
     if not is_allowed(cb.from_user.id):
         await cb.answer("⛔ Нет доступа")
         return
-    await cb.message.edit_text("🔍 Ищу интересные темы...", parse_mode=ParseMode.HTML)
-    await cb.answer()
+    await cb.answer("🔍 Ищу темы...")
+    search_msg = await cb.message.answer(
+        "🔍 Ищу интересные темы...", parse_mode=ParseMode.HTML
+    )
 
     try:
         s = get_settings(cb.from_user.id)
         topics = await asyncio.to_thread(search_news, "", s.get("model", DEFAULT_MODEL))
         if not topics:
-            await cb.message.edit_text("Не удалось найти темы. Попробуй ещё раз.",
-                                       reply_markup=main_menu_kb())
+            await search_msg.edit_text(
+                "Не удалось найти темы. Попробуй ещё раз.",
+                reply_markup=main_menu_kb(cb.from_user.id),
+            )
             return
 
-        # Store topics for picking
+        # Persist topics
+        save_topics(topics)
         _topic_cache[cb.from_user.id] = topics
 
         lines = []
@@ -243,14 +379,16 @@ async def cb_news(cb: CallbackQuery):
                 lines.append(f"   <i>{hook}</i>")
 
         text = "🔍 <b>Найденные темы:</b>\n\n" + "\n".join(lines) + "\n\nВыбери тему:"
-        await cb.message.edit_text(text, parse_mode=ParseMode.HTML,
-                                    reply_markup=news_topics_kb(topics))
+        await search_msg.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=news_topics_kb(topics)
+        )
     except Exception as e:
         log.exception("News search failed")
-        await cb.message.edit_text(f"❌ Ошибка поиска: {e}", reply_markup=main_menu_kb())
+        await search_msg.edit_text(
+            f"❌ Ошибка поиска: {e}", reply_markup=main_menu_kb(cb.from_user.id)
+        )
 
 
-# Topic cache (user_id -> list of topics)
 _topic_cache: dict[int, list] = {}
 
 
@@ -266,8 +404,55 @@ async def cb_pick_topic(cb: CallbackQuery):
         return
     topic = topics[idx].get("topic", "")
     await cb.answer(f"Генерирую: {topic[:30]}...")
-    await cb.message.edit_text(f"⏳ Генерирую пост: <i>{topic}</i>...", parse_mode=ParseMode.HTML)
-    await _do_generate_from_cb(cb, topic)
+    status_msg = await cb.message.answer(
+        f"⏳ Генерирую пост: <i>{topic}</i>...", parse_mode=ParseMode.HTML
+    )
+    await _do_generate_from_status(status_msg, cb.from_user.id, topic)
+
+
+# --- Saved topics ---
+
+@router.callback_query(F.data.startswith("saved_topics:"))
+async def cb_saved_topics(cb: CallbackQuery):
+    page = int(cb.data.split(":")[1])
+    topics = get_all_saved_topics()
+    if not topics:
+        await cb.answer("Пока нет сохранённых тем")
+        return
+
+    total = len(topics)
+    per_page = 7
+    total_pages = (total + per_page - 1) // per_page
+
+    text = f"📋 <b>Сохранённые темы</b> (стр. {page + 1}/{total_pages}, всего {total}):\n\nВыбери тему для генерации:"
+
+    try:
+        await cb.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=saved_topics_kb(topics, page)
+        )
+    except Exception:
+        await cb.message.answer(
+            text, parse_mode=ParseMode.HTML, reply_markup=saved_topics_kb(topics, page)
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("saved_pick:"))
+async def cb_saved_pick(cb: CallbackQuery):
+    if not is_allowed(cb.from_user.id):
+        await cb.answer("⛔")
+        return
+    idx = int(cb.data.split(":")[1])
+    topics = get_all_saved_topics()
+    if idx >= len(topics):
+        await cb.answer("Тема не найдена")
+        return
+    topic = topics[idx].get("topic", "")
+    await cb.answer(f"Генерирую: {topic[:30]}...")
+    status_msg = await cb.message.answer(
+        f"⏳ Генерирую пост: <i>{topic}</i>...", parse_mode=ParseMode.HTML
+    )
+    await _do_generate_from_status(status_msg, cb.from_user.id, topic)
 
 
 # --- Settings ---
@@ -295,8 +480,9 @@ async def cb_tone_picked(cb: CallbackQuery):
     s = get_settings(cb.from_user.id)
     s["tone"] = name
     set_settings(cb.from_user.id, s)
-    await cb.message.edit_text(f"✅ Тон: <b>{name}</b>", parse_mode=ParseMode.HTML,
-                                reply_markup=settings_kb(s))
+    await cb.message.edit_text(
+        f"✅ Тон: <b>{name}</b>", parse_mode=ParseMode.HTML, reply_markup=settings_kb(s)
+    )
     await cb.answer()
 
 
@@ -313,8 +499,9 @@ async def cb_theme_picked(cb: CallbackQuery):
     s["theme"] = theme
     set_settings(cb.from_user.id, s)
     label = {"warm": "🟤 Тёплая", "dark": "⚫ Тёмная", "blue": "🔵 Блюзовая"}.get(theme, theme)
-    await cb.message.edit_text(f"✅ Карточка: <b>{label}</b>", parse_mode=ParseMode.HTML,
-                                reply_markup=settings_kb(s))
+    await cb.message.edit_text(
+        f"✅ Карточка: <b>{label}</b>", parse_mode=ParseMode.HTML, reply_markup=settings_kb(s)
+    )
     await cb.answer()
 
 
@@ -331,22 +518,106 @@ async def cb_model_picked(cb: CallbackQuery):
     s["model"] = model
     set_settings(cb.from_user.id, s)
     short = model.replace("gemini-", "").replace("-preview", "")
-    await cb.message.edit_text(f"✅ Модель: <b>{short}</b>", parse_mode=ParseMode.HTML,
-                                reply_markup=settings_kb(s))
+    await cb.message.edit_text(
+        f"✅ Модель: <b>{short}</b>", parse_mode=ParseMode.HTML, reply_markup=settings_kb(s)
+    )
     await cb.answer()
 
 
-# --- Generation helpers ---
+# --- Admin stats ---
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_USER_ID:
+        await cb.answer("⛔ Только для администратора")
+        return
+    await _send_stats(cb.message, edit=True)
+    await cb.answer()
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+HELP_TEXT = """🎸 <b>Закрытый клуб Павла Сидоренко — Помощь</b>
+
+<b>Команды:</b>
+/start — главное меню
+/menu — показать меню
+/help — эта справка
+/generate &lt;тема&gt; — сгенерировать пост по теме
+
+<b>Как пользоваться:</b>
+1. <b>🔍 Найти темы</b> — бот найдёт 5-7 интересных тем через Google. Выбери любую — пост сгенерируется автоматически.
+2. <b>✏️ Своя тема</b> — напиши свою тему текстом.
+3. <b>📋 Сохранённые темы</b> — все ранее найденные темы. Можно вернуться и сгенерировать.
+4. <b>⚙️ Настройки</b> — тон текста, тема карточки, модель AI.
+
+<b>Тематика:</b>
+Джаз, блюз, фьюжн, рок, фанк. Гитары, педали, усилители, струны, микрофоны, кабели. Легендарные музыканты, новинки, релизы альбомов.
+
+<b>Результат:</b>
+Карточка 1080×1080 + готовый форматированный пост для Telegram."""
+
+
+async def _send_help(target: Message, edit: bool = False):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Меню", callback_data="back_main")]
+    ])
+    if edit:
+        await target.edit_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await target.answer(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _send_stats(target: Message, edit: bool = False):
+    archive = load_archive()
+    total = len(archive)
+
+    if total == 0:
+        text = "📊 <b>Статистика</b>\n\nПока нет сгенерированных карточек."
+    else:
+        # By rubric
+        rubrics = Counter(p.get("rubric", "—").upper() for p in archive)
+        rubric_lines = "\n".join(
+            f"  {r}: {c}" for r, c in rubrics.most_common(15)
+        )
+
+        # By date
+        dates = Counter(p.get("date", "")[:10] for p in archive if p.get("date"))
+        recent_dates = sorted(dates.items(), reverse=True)[:7]
+        date_lines = "\n".join(f"  {d}: {c} шт." for d, c in recent_dates)
+
+        # Saved topics
+        saved = get_all_saved_topics()
+
+        text = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"<b>Всего карточек:</b> {total}\n"
+            f"<b>Сохранённых тем:</b> {len(saved)}\n\n"
+            f"<b>По рубрикам:</b>\n{rubric_lines}\n\n"
+            f"<b>По дням (последние 7):</b>\n{date_lines}"
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Меню", callback_data="back_main")]
+    ])
+    if edit:
+        await target.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
 
 async def _do_generate(message: Message, topic: str):
-    """Generate and send post from a regular message."""
     s = get_settings(message.from_user.id)
     tone_name = s.get("tone", "Клубный")
     tone = TONE_PROFILES.get(tone_name, DEFAULT_TONE)
     model = s.get("model", DEFAULT_MODEL)
     theme = s.get("theme", "warm")
 
-    status_msg = await message.answer(f"⏳ Генерирую: <i>{topic[:60]}</i>...", parse_mode=ParseMode.HTML)
+    status_msg = await message.answer(
+        f"⏳ Генерирую: <i>{topic[:60]}</i>...", parse_mode=ParseMode.HTML
+    )
 
     try:
         post = await asyncio.to_thread(generate_post, topic, tone, model, theme)
@@ -361,9 +632,8 @@ async def _do_generate(message: Message, topic: str):
             pass
 
 
-async def _do_generate_from_cb(cb: CallbackQuery, topic: str):
-    """Generate and send post from a callback query."""
-    s = get_settings(cb.from_user.id)
+async def _do_generate_from_status(status_msg: Message, user_id: int, topic: str):
+    s = get_settings(user_id)
     tone_name = s.get("tone", "Клубный")
     tone = TONE_PROFILES.get(tone_name, DEFAULT_TONE)
     model = s.get("model", DEFAULT_MODEL)
@@ -371,27 +641,24 @@ async def _do_generate_from_cb(cb: CallbackQuery, topic: str):
 
     try:
         post = await asyncio.to_thread(generate_post, topic, tone, model, theme)
-        # Delete the "generating..." message
-        try:
-            await cb.message.delete()
-        except Exception:
-            pass
-        await _send_post(cb.message, post)
+        await _send_post(status_msg, post)
     except Exception as e:
         log.exception("Generation failed")
-        await cb.message.edit_text(f"❌ Ошибка: {e}", reply_markup=main_menu_kb())
+        await status_msg.answer(f"❌ Ошибка генерации: {e}")
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 async def _send_post(target: Message, post: dict):
-    """Send card image + formatted post text."""
     card_bytes = card_to_bytes(post["card_image"])
     text = format_tg_post(post)
 
-    # Send card image
     photo = BufferedInputFile(card_bytes, filename="card.png")
     await target.answer_photo(photo=photo)
 
-    # Send formatted text
     await target.answer(
         text,
         parse_mode=ParseMode.HTML,
@@ -405,7 +672,22 @@ async def _send_post(target: Message, post: dict):
     )
 
 
-# --- Main ---
+# ============================================================
+# Bot commands menu (persistent button)
+# ============================================================
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="generate", description="Сгенерировать пост по теме"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="stats", description="Статистика (админ)"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+# ============================================================
+# Main
+# ============================================================
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не задан в .env")
@@ -415,6 +697,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
+    await set_bot_commands(bot)
     log.info("Bot starting...")
     await dp.start_polling(bot)
 
