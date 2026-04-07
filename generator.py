@@ -239,7 +239,16 @@ def search_news(query: str = "", model: str = DEFAULT_MODEL) -> List[Dict[str, s
 
 # --- Format for Telegram (HTML) ---
 def format_tg_post(post: Dict[str, Any]) -> str:
-    """Format post as Telegram HTML message."""
+    """Format post as Telegram HTML message.
+
+    Format:
+    🎸 РУБРИКА
+    ЗАГОЛОВОК (bold)
+    Лид (краткая суть)
+    <blockquote>Тело поста</blockquote>
+    #хештеги
+    Источники (ссылки)
+    """
     rubric = post.get("rubric", "").upper()
     title = post.get("title", "").upper()
     essence = post.get("essence", "")
@@ -247,14 +256,17 @@ def format_tg_post(post: Dict[str, Any]) -> str:
     sources = post.get("sources", [])
     hashtags = post.get("hashtags", "")
 
-    parts = [f"🎸 <b>{_esc(rubric)}</b>"]
+    parts = [f"🎸  {_esc(rubric)}"]
     parts.append(f"\n<b>{_esc(title)}</b>")
 
     if essence:
         parts.append(f"\n{_esc(essence)}")
 
     if body:
-        parts.append(f"\n{_esc(body)}")
+        parts.append(f"\n<blockquote>{_esc(body)}</blockquote>")
+
+    if hashtags:
+        parts.append(f"\n{_esc(hashtags)}")
 
     if sources:
         links = []
@@ -262,14 +274,11 @@ def format_tg_post(post: Dict[str, Any]) -> str:
             t = s.get("title", "Источник")
             u = s.get("url", "")
             if u:
-                links.append(f'🔗 <a href="{u}">{_esc(t)}</a>')
+                links.append(f'<a href="{u}">{_esc(t)}</a>')
             else:
-                links.append(f"🔗 {_esc(t)}")
+                links.append(f"{_esc(t)}")
         if links:
-            parts.append("\n📚 <b>Источники:</b>\n" + "\n".join(links))
-
-    if hashtags:
-        parts.append(f"\n{_esc(hashtags)}")
+            parts.append("\n" + "\n".join(links))
 
     return "\n".join(parts)
 
