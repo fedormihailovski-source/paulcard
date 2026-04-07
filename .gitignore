@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+archive/images/
+archive/posts.json
+user_settings.json
+*.log
+.venv/

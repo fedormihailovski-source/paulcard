@@ -1,0 +1,9 @@
+services:
+  guitar-bot:
+    build: .
+    container_name: guitar-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./archive:/app/archive
+      - ./user_settings.json:/app/user_settings.json
