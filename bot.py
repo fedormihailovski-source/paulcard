@@ -136,6 +136,9 @@ def is_allowed(user_id: int) -> bool:
 # ============================================================
 class Gen(StatesGroup):
     waiting_topic = State()
+    edit_title = State()
+    edit_rubric = State()
+    edit_lead = State()
 
 
 # ============================================================
@@ -390,6 +393,7 @@ async def cb_news(cb: CallbackQuery):
 
 
 _topic_cache: dict[int, list] = {}
+_post_cache: dict[int, dict] = {}  # user_id -> last generated post
 
 
 @router.callback_query(F.data.startswith("pick:"))
@@ -524,6 +528,128 @@ async def cb_model_picked(cb: CallbackQuery):
     await cb.answer()
 
 
+# --- Edit card ---
+
+def edit_card_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Заголовок", callback_data="edit:title")],
+        [InlineKeyboardButton(text="🏷 Рубрика", callback_data="edit:rubric")],
+        [InlineKeyboardButton(text="💬 Лид-текст", callback_data="edit:lead")],
+        [InlineKeyboardButton(text="← Меню", callback_data="back_main")],
+    ])
+
+
+@router.callback_query(F.data == "edit_card")
+async def cb_edit_card(cb: CallbackQuery):
+    post = _post_cache.get(cb.from_user.id)
+    if not post:
+        await cb.answer("Нет карточки для редактирования")
+        return
+    text = (
+        "✏️ <b>Редактирование карточки</b>\n\n"
+        f"<b>Заголовок:</b> {post.get('title', '—')}\n"
+        f"<b>Рубрика:</b> {post.get('rubric', '—')}\n"
+        f"<b>Лид:</b> {post.get('essence', '—')}\n\n"
+        "Что изменить?"
+    )
+    await cb.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=edit_card_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "edit:title")
+async def cb_edit_title(cb: CallbackQuery, state: FSMContext):
+    post = _post_cache.get(cb.from_user.id)
+    if not post:
+        await cb.answer("Нет карточки")
+        return
+    await state.set_state(Gen.edit_title)
+    await cb.message.edit_text(
+        f"Текущий заголовок: <b>{post.get('title', '—')}</b>\n\nОтправь новый заголовок:",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "edit:rubric")
+async def cb_edit_rubric(cb: CallbackQuery, state: FSMContext):
+    post = _post_cache.get(cb.from_user.id)
+    if not post:
+        await cb.answer("Нет карточки")
+        return
+    await state.set_state(Gen.edit_rubric)
+    await cb.message.edit_text(
+        f"Текущая рубрика: <b>{post.get('rubric', '—')}</b>\n\nОтправь новую рубрику:",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "edit:lead")
+async def cb_edit_lead(cb: CallbackQuery, state: FSMContext):
+    post = _post_cache.get(cb.from_user.id)
+    if not post:
+        await cb.answer("Нет карточки")
+        return
+    await state.set_state(Gen.edit_lead)
+    await cb.message.edit_text(
+        f"Текущий лид: <b>{post.get('essence', '—')}</b>\n\nОтправь новый текст:",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+
+@router.message(Gen.edit_title)
+async def on_edit_title(message: Message, state: FSMContext):
+    await state.clear()
+    await _apply_card_edit(message, "title", message.text.strip())
+
+
+@router.message(Gen.edit_rubric)
+async def on_edit_rubric(message: Message, state: FSMContext):
+    await state.clear()
+    await _apply_card_edit(message, "rubric", message.text.strip())
+
+
+@router.message(Gen.edit_lead)
+async def on_edit_lead(message: Message, state: FSMContext):
+    await state.clear()
+    await _apply_card_edit(message, "essence", message.text.strip())
+
+
+async def _apply_card_edit(message: Message, field: str, value: str):
+    post = _post_cache.get(message.from_user.id)
+    if not post:
+        await message.answer("Нет карточки для редактирования. Сгенерируй новую.")
+        return
+
+    post[field] = value
+
+    # Regenerate card image with updated text
+    from image import render_card_image
+    s = get_settings(message.from_user.id)
+    theme = s.get("theme", "warm")
+    post["card_image"] = render_card_image(
+        post.get("title", ""),
+        post.get("rubric", ""),
+        post.get("essence", ""),
+        None,
+        theme=theme,
+    )
+    _post_cache[message.from_user.id] = post
+
+    # Send updated card
+    card_bytes = card_to_bytes(post["card_image"])
+    photo = BufferedInputFile(card_bytes, filename="card.png")
+    await message.answer_photo(photo=photo)
+
+    field_names = {"title": "Заголовок", "rubric": "Рубрика", "essence": "Лид"}
+    await message.answer(
+        f"✅ {field_names.get(field, field)} обновлён.\n\nПродолжить редактирование?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=edit_card_kb(),
+    )
+
+
 # --- Admin stats ---
 
 @router.callback_query(F.data == "admin_stats")
@@ -621,7 +747,7 @@ async def _do_generate(message: Message, topic: str):
 
     try:
         post = await asyncio.to_thread(generate_post, topic, tone, model, theme)
-        await _send_post(message, post)
+        await _send_post(message, post, user_id=message.from_user.id)
     except Exception as e:
         log.exception("Generation failed")
         await message.answer(f"❌ Ошибка генерации: {e}")
@@ -641,7 +767,7 @@ async def _do_generate_from_status(status_msg: Message, user_id: int, topic: str
 
     try:
         post = await asyncio.to_thread(generate_post, topic, tone, model, theme)
-        await _send_post(status_msg, post)
+        await _send_post(status_msg, post, user_id=user_id)
     except Exception as e:
         log.exception("Generation failed")
         await status_msg.answer(f"❌ Ошибка генерации: {e}")
@@ -652,7 +778,11 @@ async def _do_generate_from_status(status_msg: Message, user_id: int, topic: str
             pass
 
 
-async def _send_post(target: Message, post: dict):
+async def _send_post(target: Message, post: dict, user_id: int = 0):
+    # Cache post for editing
+    if user_id:
+        _post_cache[user_id] = post
+
     card_bytes = card_to_bytes(post["card_image"])
     text = format_tg_post(post)
 
@@ -665,9 +795,12 @@ async def _send_post(target: Message, post: dict):
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
+                InlineKeyboardButton(text="✏️ Редактировать карточку", callback_data="edit_card"),
+            ],
+            [
                 InlineKeyboardButton(text="🔍 Ещё темы", callback_data="news"),
                 InlineKeyboardButton(text="← Меню", callback_data="back_main"),
-            ]
+            ],
         ]),
     )
 
