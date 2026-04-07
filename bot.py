@@ -532,9 +532,18 @@ async def cb_model_picked(cb: CallbackQuery):
 
 def edit_card_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Заголовок", callback_data="edit:title")],
-        [InlineKeyboardButton(text="🏷 Рубрика", callback_data="edit:rubric")],
-        [InlineKeyboardButton(text="💬 Лид-текст", callback_data="edit:lead")],
+        [
+            InlineKeyboardButton(text="📝 Заголовок", callback_data="edit:title"),
+            InlineKeyboardButton(text="🏷 Рубрика", callback_data="edit:rubric"),
+        ],
+        [
+            InlineKeyboardButton(text="💬 Лид-текст", callback_data="edit:lead"),
+        ],
+        [
+            InlineKeyboardButton(text="🟤 Тёплая", callback_data="card_theme:warm"),
+            InlineKeyboardButton(text="⚫ Тёмная", callback_data="card_theme:dark"),
+            InlineKeyboardButton(text="🔵 Блюзовая", callback_data="card_theme:blue"),
+        ],
         [InlineKeyboardButton(text="← Меню", callback_data="back_main")],
     ])
 
@@ -648,6 +657,43 @@ async def _apply_card_edit(message: Message, field: str, value: str):
         parse_mode=ParseMode.HTML,
         reply_markup=edit_card_kb(),
     )
+
+
+@router.callback_query(F.data.startswith("card_theme:"))
+async def cb_card_theme(cb: CallbackQuery):
+    post = _post_cache.get(cb.from_user.id)
+    if not post:
+        await cb.answer("Нет карточки")
+        return
+    theme = cb.data.split(":", 1)[1]
+
+    # Update user settings too
+    s = get_settings(cb.from_user.id)
+    s["theme"] = theme
+    set_settings(cb.from_user.id, s)
+
+    # Regenerate card
+    from image import render_card_image
+    post["card_image"] = render_card_image(
+        post.get("title", ""),
+        post.get("rubric", ""),
+        post.get("essence", ""),
+        None,
+        theme=theme,
+    )
+    _post_cache[cb.from_user.id] = post
+
+    card_bytes = card_to_bytes(post["card_image"])
+    photo = BufferedInputFile(card_bytes, filename="card.png")
+    await cb.message.answer_photo(photo=photo)
+
+    label = {"warm": "🟤 Тёплая", "dark": "⚫ Тёмная", "blue": "🔵 Блюзовая"}.get(theme, theme)
+    await cb.message.answer(
+        f"✅ Тема карточки: <b>{label}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=edit_card_kb(),
+    )
+    await cb.answer()
 
 
 # --- Admin stats ---

@@ -263,7 +263,7 @@ def format_tg_post(post: Dict[str, Any]) -> str:
         parts.append(f"\n{_esc(essence)}")
 
     if body:
-        parts.append(f"\n<blockquote>{_esc(body)}</blockquote>")
+        parts.append(f"\n<blockquote expandable>{_esc(body)}</blockquote>")
 
     if hashtags:
         parts.append(f"\n{_esc(hashtags)}")
