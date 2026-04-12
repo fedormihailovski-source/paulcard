@@ -226,7 +226,11 @@ def search_news(query: str = "", model: str = DEFAULT_MODEL) -> List[Dict[str, s
     client = _get_client()
     prompt = NEWS_SEARCH_INSTRUCTION
     if query.strip():
-        prompt += f"\n\nДополнительный фокус поиска: {query.strip()}"
+        prompt += (
+            f"\n\nСТРОГОЕ ОГРАНИЧЕНИЕ: ищи темы ТОЛЬКО по направлению: {query.strip()}"
+            "\nВСЕ 10 тем должны быть строго в рамках этого направления. "
+            "Никаких тем из других категорий."
+        )
 
     config = types.GenerateContentConfig(
         tools=[types.Tool(google_search=types.GoogleSearch())],

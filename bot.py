@@ -221,7 +221,7 @@ def model_kb() -> InlineKeyboardMarkup:
 
 def news_topics_kb(topics: list, offset: int = 0, cat_key: str = "all") -> InlineKeyboardMarkup:
     buttons = []
-    for i, t in enumerate(topics[:7]):
+    for i, t in enumerate(topics[:10]):
         topic_text = t.get("topic", "")[:45]
         rubric = t.get("rubric", "")
         buttons.append([InlineKeyboardButton(
@@ -237,7 +237,7 @@ def news_topics_kb(topics: list, offset: int = 0, cat_key: str = "all") -> Inlin
 
 
 def saved_topics_kb(topics: list, page: int = 0) -> InlineKeyboardMarkup:
-    per_page = 7
+    per_page = 10
     start = page * per_page
     chunk = topics[start:start + per_page]
     buttons = []
@@ -458,7 +458,7 @@ async def cb_saved_topics(cb: CallbackQuery):
         return
 
     total = len(topics)
-    per_page = 7
+    per_page = 10
     total_pages = (total + per_page - 1) // per_page
 
     text = f"📋 <b>Сохранённые темы</b> (стр. {page + 1}/{total_pages}, всего {total}):\n\nВыбери тему для генерации:"
