@@ -28,6 +28,7 @@ from config import (
     DEFAULT_TONE,
     STATIC_MODEL_OPTIONS,
     TONE_PROFILES,
+    TOPIC_CATEGORIES,
 )
 from generator import (
     generate_post,
@@ -66,7 +67,7 @@ def _save_all_settings(data: dict):
 def get_settings(user_id: int) -> dict:
     all_s = _load_all_settings()
     return all_s.get(str(user_id), {
-        "tone": "Клубный",
+        "tone": "Профи",
         "theme": "warm",
         "model": DEFAULT_MODEL,
     })
@@ -147,7 +148,7 @@ class Gen(StatesGroup):
 def main_menu_kb(user_id: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="🔍 Найти темы", callback_data="news"),
+            InlineKeyboardButton(text="🔍 Найти темы", callback_data="categories"),
             InlineKeyboardButton(text="✏️ Своя тема", callback_data="custom_topic"),
         ],
         [
@@ -161,6 +162,17 @@ def main_menu_kb(user_id: int = 0) -> InlineKeyboardMarkup:
     if user_id == ADMIN_USER_ID:
         rows.append([InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def categories_kb() -> InlineKeyboardMarkup:
+    buttons = []
+    for key, cat in TOPIC_CATEGORIES.items():
+        buttons.append([InlineKeyboardButton(
+            text=cat["label"],
+            callback_data=f"cat:{key}",
+        )])
+    buttons.append([InlineKeyboardButton(text="← Меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def settings_kb(s: dict) -> InlineKeyboardMarkup:
@@ -207,7 +219,7 @@ def model_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def news_topics_kb(topics: list, offset: int = 0) -> InlineKeyboardMarkup:
+def news_topics_kb(topics: list, offset: int = 0, cat_key: str = "all") -> InlineKeyboardMarkup:
     buttons = []
     for i, t in enumerate(topics[:7]):
         topic_text = t.get("topic", "")[:45]
@@ -217,7 +229,8 @@ def news_topics_kb(topics: list, offset: int = 0) -> InlineKeyboardMarkup:
             callback_data=f"pick:{offset + i}",
         )])
     buttons.append([
-        InlineKeyboardButton(text="🔄 Ещё темы", callback_data="news"),
+        InlineKeyboardButton(text="🔄 Ещё темы", callback_data=f"cat:{cat_key}"),
+        InlineKeyboardButton(text="📂 Категории", callback_data="categories"),
         InlineKeyboardButton(text="← Меню", callback_data="back_main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -348,21 +361,41 @@ async def on_topic_text(message: Message, state: FSMContext):
     await _do_generate(message, message.text.strip())
 
 
-# --- News search ---
+# --- Categories ---
 
-@router.callback_query(F.data == "news")
-async def cb_news(cb: CallbackQuery):
+@router.callback_query(F.data == "categories")
+async def cb_categories(cb: CallbackQuery):
     if not is_allowed(cb.from_user.id):
         await cb.answer("⛔ Нет доступа")
         return
-    await cb.answer("🔍 Ищу темы...")
+    await cb.message.edit_text(
+        "🔍 <b>Выбери тематику:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=categories_kb(),
+    )
+    await cb.answer()
+
+
+# --- News search ---
+
+@router.callback_query(F.data.startswith("cat:"))
+async def cb_cat_search(cb: CallbackQuery):
+    if not is_allowed(cb.from_user.id):
+        await cb.answer("⛔ Нет доступа")
+        return
+    cat_key = cb.data.split(":", 1)[1]
+    cat = TOPIC_CATEGORIES.get(cat_key, TOPIC_CATEGORIES["all"])
+    cat_label = cat["label"]
+    query = cat["query"]
+
+    await cb.answer(f"🔍 Ищу: {cat_label}...")
     search_msg = await cb.message.answer(
-        "🔍 Ищу интересные темы...", parse_mode=ParseMode.HTML
+        f"🔍 Ищу темы: <b>{cat_label}</b>...", parse_mode=ParseMode.HTML
     )
 
     try:
         s = get_settings(cb.from_user.id)
-        topics = await asyncio.to_thread(search_news, "", s.get("model", DEFAULT_MODEL))
+        topics = await asyncio.to_thread(search_news, query, s.get("model", DEFAULT_MODEL))
         if not topics:
             await search_msg.edit_text(
                 "Не удалось найти темы. Попробуй ещё раз.",
@@ -381,9 +414,9 @@ async def cb_news(cb: CallbackQuery):
             if hook:
                 lines.append(f"   <i>{hook}</i>")
 
-        text = "🔍 <b>Найденные темы:</b>\n\n" + "\n".join(lines) + "\n\nВыбери тему:"
+        text = f"🔍 <b>{cat_label} — найденные темы:</b>\n\n" + "\n".join(lines) + "\n\nВыбери тему:"
         await search_msg.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=news_topics_kb(topics)
+            text, parse_mode=ParseMode.HTML, reply_markup=news_topics_kb(topics, cat_key=cat_key)
         )
     except Exception as e:
         log.exception("News search failed")
@@ -720,16 +753,16 @@ HELP_TEXT = """🎸 <b>Закрытый клуб Павла Сидоренко �
 /generate &lt;тема&gt; — сгенерировать пост по теме
 
 <b>Как пользоваться:</b>
-1. <b>🔍 Найти темы</b> — бот найдёт 5-7 интересных тем через Google. Выбери любую — пост сгенерируется автоматически.
+1. <b>🔍 Найти темы</b> — выбери тематику (педали, гитары, музыканты и т.д.), бот найдёт 5-7 тем через Google.
 2. <b>✏️ Своя тема</b> — напиши свою тему текстом.
 3. <b>📋 Сохранённые темы</b> — все ранее найденные темы. Можно вернуться и сгенерировать.
 4. <b>⚙️ Настройки</b> — тон текста, тема карточки, модель AI.
 
-<b>Тематика:</b>
-Джаз, блюз, фьюжн, рок, фанк. Гитары, педали, усилители, струны, микрофоны, кабели. Легендарные музыканты, новинки, релизы альбомов.
+<b>Тематики:</b>
+🎛 Педали и эффекты · 🎸 Гитары · 🎤 Музыканты · 🔊 Усилители · ✋ Техника · 🔧 Оборудование · 💿 Релизы · 📜 История
 
 <b>Результат:</b>
-Карточка 1080×1080 + готовый форматированный пост для Telegram."""
+Карточка 1080×1080 + информационный пост для Telegram."""
 
 
 async def _send_help(target: Message, edit: bool = False):
@@ -844,7 +877,7 @@ async def _send_post(target: Message, post: dict, user_id: int = 0):
                 InlineKeyboardButton(text="✏️ Редактировать карточку", callback_data="edit_card"),
             ],
             [
-                InlineKeyboardButton(text="🔍 Ещё темы", callback_data="news"),
+                InlineKeyboardButton(text="🔍 Ещё темы", callback_data="categories"),
                 InlineKeyboardButton(text="← Меню", callback_data="back_main"),
             ],
         ]),
